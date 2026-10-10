@@ -1,0 +1,349 @@
+plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+android {
+    namespace 'com.adjm.videoplayer'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.adjm.videoplayer"
+        minSdk 29
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = '17' }
+}
+dependencies { implementation 'androidx.media3:media3-exoplayer:1.4.1' }
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+    <application android:label="ADJM Player" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <activity android:name=".MainActivity" android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="content"/>
+                <data android:scheme="file"/>
+                <data android:mimeType="video/*"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.7 }
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ADJM-Player-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+package com.adjm.videoplayer
+
+import android.Manifest
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.ContentUris
+import android.content.ContentValues
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
+import android.util.Size
+import android.view.*
+import android.widget.*
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.ExoPlayer
+import java.util.concurrent.Executors
+
+data class Vid(val uri: Uri, val name: String, val durMs: Long)
+
+class MainActivity : Activity() {
+    private lateinit var player: ExoPlayer
+    private lateinit var root: FrameLayout
+    private lateinit var frame: FrameLayout
+    private lateinit var tv: TextureView
+    private lateinit var overlay: FrameLayout
+    private lateinit var title: TextView
+    private lateinit var seek: SeekBar
+    private lateinit var tCur: TextView
+    private lateinit var tDur: TextView
+    private lateinit var btnPlay: TextView
+    private lateinit var btnRatio: TextView
+    private lateinit var btnMute: TextView
+    private lateinit var btnSpeed: TextView
+    private lateinit var preview: ImageView
+    private val h = Handler(Looper.getMainLooper())
+    private val io = Executors.newFixedThreadPool(2)
+    private val prefs by lazy { getSharedPreferences("s", 0) }
+    private var portrait = true
+    private var vw = 0
+    private var vh = 0
+    private var dragging = false
+    private var videos = listOf<Vid>()
+    private val speeds = floatArrayOf(1f, 1.5f, 2f, 0.5f)
+    private var speedIdx = 0
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun btn(txt: String, sp: Float = 20f, bg: Boolean = true, click: () -> Unit): TextView =
+        TextView(this).apply {
+            text = txt; textSize = sp; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            if (bg) background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0x66000000) }
+            setOnClickListener { click() }
+        }
+
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        hideBars()
+        player = ExoPlayer.Builder(this).build()
+        player.pauseAtEndOfMediaItems = !prefs.getBoolean("autonext", true)
+
+        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        frame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        tv = TextureView(this)
+        player.setVideoTextureView(tv)
+        frame.addView(tv, FrameLayout.LayoutParams(1, 1, Gravity.CENTER))
+        root.addView(frame, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent) = true
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                overlay.visibility = if (overlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE; return true
+            }
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                val d = if (e.x < frame.width / 2) -10000L else 10000L
+                player.seekTo((player.currentPosition + d).coerceIn(0, player.duration.coerceAtLeast(0))); return true
+            }
+        })
+        frame.setOnTouchListener { _, e -> gd.onTouchEvent(e); true }
+
+        overlay = FrameLayout(this)
+        root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+
+        val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), dp(24), dp(8), 0) }
+        title = TextView(this).apply {
+            text = "Tekan 📁 untuk memilih video"; setTextColor(Color.WHITE); textSize = 14f
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        btnRatio = btn("▯ 9:16", 13f) { toggleRatio() }
+        btnMute = btn("🔊") { player.volume = if (player.volume > 0) 0f else 1f; btnMute.text = if (player.volume > 0) "🔊" else "🔇" }
+        btnSpeed = btn("1x", 13f) {
+            speedIdx = (speedIdx + 1) % speeds.size
+            player.setPlaybackSpeed(speeds[speedIdx]); btnSpeed.text = "${speeds[speedIdx]}x".replace(".0x", "x")
+        }
+        val bSet = btn("⚙") { showSettings() }
+        top.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+        for (v in listOf(btnRatio, btnMute, btnSpeed, bSet))
+            top.addView(v, LinearLayout.LayoutParams(if (v === btnRatio) dp(72) else dp(44), dp(44)).apply { marginStart = dp(6) })
+        overlay.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+
+        val cam = btn("📷", 30f, false) { shot() }.apply { alpha = 0.5f }
+        overlay.addView(cam, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.END or Gravity.CENTER_VERTICAL))
+
+        val bottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), 0, dp(12), dp(16)) }
+        val tl = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        tCur = TextView(this).apply { text = "00:00"; setTextColor(Color.WHITE); textSize = 12f }
+        tDur = TextView(this).apply { text = "00:00"; setTextColor(Color.WHITE); textSize = 12f }
+        seek = SeekBar(this)
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar, p: Int, u: Boolean) { if (u) tCur.text = fmt(p.toLong()) }
+            override fun onStartTrackingTouch(s: SeekBar) { dragging = true }
+            override fun onStopTrackingTouch(s: SeekBar) { dragging = false; player.seekTo(s.progress.toLong()) }
+        })
+        tl.addView(tCur); tl.addView(seek, LinearLayout.LayoutParams(0, -2, 1f)); tl.addView(tDur)
+        val row = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        btnPlay = btn("▶", 26f) { if (player.isPlaying) player.pause() else player.play() }
+        fun add(v: View, s: Int = 48) = row.addView(v, LinearLayout.LayoutParams(dp(s), dp(s)).apply { marginStart = dp(8); marginEnd = dp(8) })
+        add(btn("📁") { openList() })
+        add(btn("⏮") { player.seekToPreviousMediaItem() })
+        add(btn("⏪") { player.seekTo((player.currentPosition - 10000).coerceAtLeast(0)) })
+        add(btnPlay, 64)
+        add(btn("⏩") { player.seekTo((player.currentPosition + 10000).coerceAtMost(player.duration.coerceAtLeast(0))) })
+        add(btn("⏭") { player.seekToNextMediaItem() })
+        bottom.addView(tl); bottom.addView(row)
+        overlay.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+
+        preview = ImageView(this).apply {
+            visibility = View.GONE; scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.WHITE); setPadding(dp(3), dp(3), dp(3), dp(3))
+        }
+        root.addView(preview, FrameLayout.LayoutParams(dp(110), dp(170), Gravity.START or Gravity.CENTER_VERTICAL).apply { marginStart = dp(12) })
+        setContentView(root)
+        root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> relayout() }
+
+        player.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(v: VideoSize) {
+                vw = v.width; vh = v.height; relayout()
+            }
+            override fun onIsPlayingChanged(p: Boolean) { btnPlay.text = if (p) "⏸" else "▶" }
+            override fun onMediaItemTransition(m: MediaItem?, r: Int) {
+                title.text = m?.mediaMetadata?.title ?: ""
+            }
+            override fun onPlaybackStateChanged(s: Int) {
+                if (s == Player.STATE_READY) { seek.max = player.duration.toInt(); tDur.text = fmt(player.duration) }
+            }
+        })
+        tick()
+        intent?.data?.let { play(listOf(Vid(it, it.lastPathSegment ?: "video", 0)), 0) }
+    }
+
+    private fun hideBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else @Suppress("DEPRECATION") {
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
+    }
+
+    private fun relayout() {
+        val rw = root.width; val rh = root.height
+        if (rw == 0 || rh == 0) return
+        val r = if (portrait) 9f / 16f else 16f / 9f
+        var fw = rw; var fh = (rw / r).toInt()
+        if (fh > rh) { fh = rh; fw = (rh * r).toInt() }
+        val lp = frame.layoutParams as FrameLayout.LayoutParams
+        if (lp.width != fw || lp.height != fh) { lp.width = fw; lp.height = fh; lp.gravity = Gravity.CENTER; frame.layoutParams = lp }
+        if (vw > 0 && vh > 0) {
+            val s = maxOf(fw / vw.toFloat(), fh / vh.toFloat())
+            val tw = (vw * s).toInt(); val th = (vh * s).toInt()
+            val tl = tv.layoutParams as FrameLayout.LayoutParams
+            if (tl.width != tw || tl.height != th) { tl.width = tw; tl.height = th; tl.gravity = Gravity.CENTER; tv.layoutParams = tl }
+        }
+    }
+
+    private fun toggleRatio() {
+        portrait = !portrait
+        btnRatio.text = if (portrait) "▯ 9:16" else "▭ 16:9"
+        relayout()
+    }
+
+    private fun tick() {
+        if (!dragging && player.duration > 0) { seek.progress = player.currentPosition.toInt(); tCur.text = fmt(player.currentPosition) }
+        h.postDelayed({ tick() }, 300)
+    }
+
+    private fun fmt(ms: Long): String {
+        val s = (ms / 1000).coerceAtLeast(0); val hh = s / 3600
+        return if (hh > 0) "%d:%02d:%02d".format(hh, s % 3600 / 60, s % 60) else "%02d:%02d".format(s / 60, s % 60)
+    }
+
+    private fun play(list: List<Vid>, index: Int) {
+        player.setMediaItems(list.map {
+            MediaItem.Builder().setUri(it.uri).setMediaMetadata(MediaMetadata.Builder().setTitle(it.name).build()).build()
+        }, index, 0)
+        player.prepare(); player.play()
+    }
+
+    private fun shot() {
+        if (vw == 0 || vh == 0 || tv.width == 0) { Toast.makeText(this, "Putar video dulu", Toast.LENGTH_SHORT).show(); return }
+        val full = tv.getBitmap(Bitmap.createBitmap(vw, vh, Bitmap.Config.ARGB_8888))
+        val cw = (vw * frame.width / tv.width.toFloat()).toInt().coerceIn(1, vw)
+        val ch = (vh * frame.height / tv.height.toFloat()).toInt().coerceIn(1, vh)
+        val out = Bitmap.createBitmap(full, (vw - cw) / 2, (vh - ch) / 2, cw, ch)
+        val cv = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "VideoShot_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/VideoShot")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+        if (uri == null) { Toast.makeText(this, "Gagal menyimpan", Toast.LENGTH_SHORT).show(); return }
+        contentResolver.openOutputStream(uri)?.use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+        preview.setImageBitmap(out); preview.visibility = View.VISIBLE
+        h.removeCallbacks(hidePrev); h.postDelayed(hidePrev, 2500)
+        Toast.makeText(this, "Tersimpan di Galeri (${if (portrait) "9:16" else "16:9"})", Toast.LENGTH_SHORT).show()
+    }
+    private val hidePrev = Runnable { preview.visibility = View.GONE }
+
+    private fun openList() {
+        val perm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
+        if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) { requestPermissions(arrayOf(perm), 1); return }
+        val list = mutableListOf<Vid>()
+        contentResolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media.DURATION),
+            null, null, "${MediaStore.Video.Media.DATE_ADDED} DESC"
+        )?.use { c ->
+            while (c.moveToNext())
+                list.add(Vid(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, c.getLong(0)), c.getString(1) ?: "video", c.getLong(2)))
+        }
+        videos = list
+        if (list.isEmpty()) { Toast.makeText(this, "Tidak ada video", Toast.LENGTH_SHORT).show(); return }
+        val lv = ListView(this)
+        val dlg = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Video terbaru").setView(lv).create()
+        lv.adapter = object : BaseAdapter() {
+            override fun getCount() = videos.size
+            override fun getItem(i: Int) = videos[i]
+            override fun getItemId(i: Int) = i.toLong()
+            override fun getView(i: Int, cv: View?, p: ViewGroup): View {
+                val row = (cv as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
+                    gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), dp(6), dp(8), dp(6))
+                    addView(ImageView(context).apply { scaleType = ImageView.ScaleType.CENTER_CROP; setBackgroundColor(0xFF222222.toInt()) }, LinearLayout.LayoutParams(dp(96), dp(54)))
+                    addView(TextView(context).apply { setTextColor(Color.WHITE); textSize = 13f; maxLines = 2 }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(10) })
+                }
+                val v = videos[i]
+                val img = row.getChildAt(0) as ImageView; val tx = row.getChildAt(1) as TextView
+                tx.text = "${v.name}\n${fmt(v.durMs)}"
+                img.setImageDrawable(null); img.tag = v.uri
+                io.execute {
+                    try {
+                        val bm = contentResolver.loadThumbnail(v.uri, Size(192, 108), null)
+                        img.post { if (img.tag == v.uri) img.setImageBitmap(bm) }
+                    } catch (_: Exception) {}
+                }
+                return row
+            }
+        }
+        lv.setOnItemClickListener { _, _, i, _ -> dlg.dismiss(); play(videos, i) }
+        dlg.show()
+    }
+
+    override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+        super.onRequestPermissionsResult(rc, p, r)
+        if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) openList()
+    }
+
+    private fun showSettings() {
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Pengaturan")
+            .setMultiChoiceItems(arrayOf("Putar video berikutnya otomatis"), booleanArrayOf(prefs.getBoolean("autonext", true))) { _, _, on ->
+                prefs.edit().putBoolean("autonext", on).apply()
+                player.pauseAtEndOfMediaItems = !on
+            }
+            .setPositiveButton("OK", null).show()
+    }
+
+    override fun onStop() { super.onStop(); player.pause() }
+    override fun onDestroy() { super.onDestroy(); h.removeCallbacksAndMessages(null); player.release(); io.shutdown() }
+}
